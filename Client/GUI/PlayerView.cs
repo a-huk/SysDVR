@@ -16,6 +16,12 @@ using System.Text;
 using System.Text.Json.Serialization;
 using System.IO;
 using System.ComponentModel;
+using OpenTK.Graphics.OpenGL4;
+using OpenTK.Mathematics;  // Add this line
+using System.Runtime.InteropServices;
+using OpenTK.Graphics;
+using SDL2;
+using FFmpeg.AutoGen;
 
 namespace SysDVR.Client.GUI
 {
@@ -41,6 +47,11 @@ namespace SysDVR.Client.GUI
 
     internal class PlayerCore
     {
+
+        private float totalTime = 0f;
+        private System.Diagnostics.Stopwatch timer = new System.Diagnostics.Stopwatch();
+
+
         internal readonly AudioPlayer? Audio;
         internal readonly VideoPlayer? Video;
         internal readonly PlayerManager Manager;
@@ -48,11 +59,59 @@ namespace SysDVR.Client.GUI
         readonly FramerateCounter fps = new();
 
         SDL_Rect DisplayRect = new SDL_Rect();
+        
+        private int shaderProgram;
+        private int framebuffer;
+        private int textureColorbuffer;
+
+        
+
+        const uint FOURCC_IYUV = 0x56555949; // 'IYUV' format
+
 
         public PlayerCore(PlayerManager manager)
         {
             Manager = manager;
+            
 
+            Console.WriteLine("Initializing PlayerCore");
+
+            // Initialize SDL with OpenGL support
+            if (SDL_Init(SDL_INIT_VIDEO) < 0)
+            {
+                throw new Exception($"Failed to initialize SDL: {SDL_GetError()}");
+            }
+            Console.WriteLine("SDL initialized");
+
+            // Set OpenGL attributes
+            SDL_GL_SetAttribute(SDL_GLattr.SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+            SDL_GL_SetAttribute(SDL_GLattr.SDL_GL_CONTEXT_MINOR_VERSION, 3);
+            SDL_GL_SetAttribute(SDL_GLattr.SDL_GL_CONTEXT_PROFILE_MASK, (int)SDL_GLprofile.SDL_GL_CONTEXT_PROFILE_CORE);
+            Console.WriteLine("OpenGL attributes set");
+
+            // Create an SDL window with OpenGL context
+            // IntPtr window = SDL_CreateWindow("OpenGL Window", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 800, 600, SDL_WindowFlags.SDL_WINDOW_OPENGL | SDL_WindowFlags.SDL_WINDOW_SHOWN);
+            // if (window == IntPtr.Zero)
+            // {
+            //     throw new Exception($"Failed to create SDL window: {SDL_GetError()}");
+            // }
+            // Console.WriteLine("SDL window created");
+            IntPtr window = Program.SdlCtx.WindowHandle;
+
+
+            // Create an OpenGL context
+            IntPtr glContext = SDL_GL_CreateContext(window);
+            if (glContext == IntPtr.Zero)
+            {
+                throw new Exception($"Failed to create OpenGL context: {SDL_GetError()}");
+            }
+            Console.WriteLine("OpenGL context created");
+            SDL_GL_SetSwapInterval(1);  // Enable V-Sync (1)
+
+            // Load OpenGL bindings using the custom bindings context
+            GL.LoadBindings(new MySDLBindingsContext());
+            Console.WriteLine("OpenGL bindings loaded");
+            
             // SyncHelper is disabled if there is only a single stream
             // Note that it can also be disabled via a --debug flag and this is handled by the constructor
             var sync = new StreamSynchronizationHelper(manager.HasAudio && manager.HasVideo);
@@ -62,8 +121,14 @@ namespace SysDVR.Client.GUI
                 Video = new(Program.Options.DecoderName, Program.Options.HardwareAccel);
                 Video.Decoder.SyncHelper = sync;
                 manager.VideoTarget.UseContext(Video.Decoder);
-
+                InitializeVideoTexture();
                 InitializeLoadingTexture();
+                InitializeShader();
+                GL.Enable(EnableCap.Blend);
+                GL.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
+                SDL_GL_SetAttribute(SDL_GLattr.SDL_GL_ALPHA_SIZE, 8);
+                InitializeQuad();
+                InitializeFramebuffer();
 
                 fps.Start();
             }
@@ -76,7 +141,302 @@ namespace SysDVR.Client.GUI
 
             manager.UseSyncManager(sync);
         }
+        private int videoTextureId;
+private void InitializeVideoTexture()
+{
+    GL.GenTextures(1, out videoTextureId);
+    GL.BindTexture(TextureTarget.Texture2D, videoTextureId);
 
+    // Set texture parameters
+    GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
+    GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
+
+    // Important: Set the texture wrapping mode to clamp to edge
+    GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)TextureWrapMode.ClampToEdge);
+    GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)TextureWrapMode.ClampToEdge);
+
+    // Allocate empty texture data (optional)
+    GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, Video.FrameWidth, Video.FrameHeight, 0, PixelFormat.Rgba, PixelType.UnsignedByte, IntPtr.Zero);
+}
+        private void InitializeShader()
+    {
+        string vertexShaderSource = @"
+        #version 330 core
+layout (location = 0) in vec2 aPos;
+layout (location = 1) in vec2 aTexCoord;
+
+out vec2 TexCoord;
+
+void main()
+{
+    gl_Position = vec4(aPos, 0.0, 1.0);
+    TexCoord = aTexCoord;
+}
+
+    ";  
+        string fragmentShaderSource = File.ReadAllText("/home/hukad/test.glsl");
+        
+        int vertexShader = GL.CreateShader(ShaderType.VertexShader);
+        GL.ShaderSource(vertexShader, vertexShaderSource);
+        GL.CompileShader(vertexShader);
+        CheckShaderCompileStatus(vertexShader);
+
+        int fragmentShader = GL.CreateShader(ShaderType.FragmentShader);
+        GL.ShaderSource(fragmentShader, fragmentShaderSource);
+        GL.CompileShader(fragmentShader);
+        CheckShaderCompileStatus(fragmentShader);
+
+        shaderProgram = GL.CreateProgram();
+        GL.AttachShader(shaderProgram, vertexShader);
+        GL.AttachShader(shaderProgram, fragmentShader);
+        GL.LinkProgram(shaderProgram);
+        CheckProgramLinkStatus(shaderProgram);
+
+        // Get uniform locations
+        int videoTextureUniform = GL.GetUniformLocation(shaderProgram, "videoTexture");
+        int projectionLocation = GL.GetUniformLocation(shaderProgram, "projection");
+        int timeLocation = GL.GetUniformLocation(shaderProgram, "iTime");
+        
+        GL.UseProgram(shaderProgram);
+
+        // Set uniforms
+        GL.Uniform1(videoTextureUniform, 0); // Texture unit 0
+        GL.Uniform1(timeLocation, 0.0f);
+
+        // Initialize the projection matrix to identity (no scaling)
+        Matrix4 projection = Matrix4.Identity;
+        GL.UniformMatrix4(projectionLocation, false, ref projection);
+
+        // Delete shaders after linking
+        GL.DeleteShader(vertexShader);
+        GL.DeleteShader(fragmentShader);
+    }
+
+    private void CheckShaderCompileStatus(int shader)
+    {
+        GL.GetShader(shader, ShaderParameter.CompileStatus, out int status);
+        if (status == (int)All.False)
+        {
+            string infoLog = GL.GetShaderInfoLog(shader);
+            Console.WriteLine(infoLog);
+            throw new Exception($"Shader compilation failed: {infoLog}");
+        }
+    }
+
+    private void CheckProgramLinkStatus(int program)
+    {
+        GL.GetProgram(program, GetProgramParameterName.LinkStatus, out int status);
+        if (status == (int)All.False)
+        {
+            string infoLog = GL.GetProgramInfoLog(program);
+            throw new Exception($"Program linking failed: {infoLog}");
+        }
+    }
+    
+    private void InitializeFramebuffer()
+{
+   GL.GenFramebuffers(1, out framebuffer);
+   GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+
+   GL.GenTextures(1, out textureColorbuffer);
+   GL.ActiveTexture(TextureUnit.Texture0);
+   GL.BindTexture(TextureTarget.Texture2D, textureColorbuffer);
+   GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgb, 1280, 720, 0, PixelFormat.Rgb, PixelType.UnsignedByte, IntPtr.Zero);
+   GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
+   GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
+
+   GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0, TextureTarget.Texture2D, textureColorbuffer, 0);
+
+   if (GL.CheckFramebufferStatus(FramebufferTarget.Framebuffer) != FramebufferErrorCode.FramebufferComplete)
+   {
+       throw new Exception("Framebuffer is not complete!");
+   }
+
+   GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+}
+
+    //define frame counter
+    private int frameCounter = 0;
+
+public void RenderFrame()
+{
+    // Update viewport to match the window size
+    int windowWidth, windowHeight;
+    SDL_GetWindowSize(Program.SdlCtx.WindowHandle, out windowWidth, out windowHeight);
+    GL.Viewport(0, 0, windowWidth, windowHeight);
+
+    // Clear and bind framebuffer
+    GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+    GL.Clear(ClearBufferMask.ColorBufferBit);
+
+    float aspectRatio = (float)Video.FrameWidth / Video.FrameHeight;
+float windowAspectRatio = (float)windowWidth / windowHeight;
+
+
+float scaleX, scaleY;
+
+if (windowAspectRatio > aspectRatio)
+{
+    // Window is wider than the video; scale X accordingly
+    scaleX = aspectRatio / windowAspectRatio;
+    scaleY = 1.0f;
+}
+else
+{
+    // Window is taller than the video; scale Y accordingly
+    scaleX = 1.0f;
+    scaleY = windowAspectRatio / aspectRatio;
+}
+
+// Create the projection matrix with the new scaling factors
+Matrix4 projection = Matrix4.CreateScale(scaleX, scaleY, 1.0f);
+
+// Use the shader program and set the projection matrix uniform
+GL.UseProgram(shaderProgram);
+int projectionLocation = GL.GetUniformLocation(shaderProgram, "projection");
+GL.UniformMatrix4(projectionLocation, false, ref projection);
+
+    // Update texture with video frame
+    UpdateOpenGLTextureWithVideoFrame();
+
+    // Bind the video texture
+    GL.ActiveTexture(TextureUnit.Texture0);
+    GL.BindTexture(TextureTarget.Texture2D, videoTextureId);
+
+    // Draw quad with shader
+    RenderQuad();
+
+    // Swap buffers
+    SDL_GL_SwapWindow(Program.SdlCtx.WindowHandle);
+}
+
+
+
+private unsafe void ConvertIYUVToRGB(IntPtr pixelBuffer, int width, int height)
+{
+    byte* yPlane = (byte*)pixelBuffer;
+    byte* uPlane = yPlane + (width * height);
+    byte* vPlane = uPlane + (width * height) / 4;
+
+    // Create a buffer for the RGB data
+    IntPtr rgbBuffer = Marshal.AllocHGlobal(width * height * 4); // RGBA
+
+            try
+            {
+                byte* rgb = (byte*)rgbBuffer;
+
+                for (int y = 0; y < height; y++)
+                {
+                    int yOffset = y * width;
+                    int uvOffset = (y / 2) * (width / 2);
+
+                    for (int x = 0; x < width; x++)
+                    {
+                        int yIndex = yOffset + x;
+                        int uvIndex = uvOffset + (x / 2);
+
+                        byte Y = yPlane[yIndex];
+                        byte U = uPlane[uvIndex];
+                        byte V = vPlane[uvIndex];
+
+                        // Convert YUV to RGB
+                        int C = Y - 16;
+                        int D = U - 128;
+                        int E = V - 128;
+
+                        int R = (298 * C + 409 * E + 128) >> 8;
+                        int G = (298 * C - 100 * D - 208 * E + 128) >> 8;
+                        int B = (298 * C + 516 * D + 128) >> 8;
+
+                        R = Math.Clamp(R, 0, 255);
+                        G = Math.Clamp(G, 0, 255);
+                        B = Math.Clamp(B, 0, 255);
+
+                        int rgbIndex = (yIndex) * 4;
+                        rgb[rgbIndex] = (byte)R;
+                        rgb[rgbIndex + 1] = (byte)G;
+                        rgb[rgbIndex + 2] = (byte)B;
+                        rgb[rgbIndex + 3] = 255; // Alpha
+                    }
+                }
+
+                // Update OpenGL texture with the RGB data
+                
+                GL.BindTexture(TextureTarget.Texture2D, textureColorbuffer);
+                GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, width, height, 0, PixelFormat.Bgra, PixelType.UnsignedByte, pixelBuffer);
+                GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
+                GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(rgbBuffer);
+            }
+}
+
+
+private void UpdateOpenGLTextureWithVideoFrame()
+{
+    
+    // Get the decoded frame data as a byte array
+    byte[] frameData = Video.GetDecodedFrame();
+    if (frameData == null)
+        return;
+
+    int width = Video.FrameWidth;
+    int height = Video.FrameHeight;
+
+    // Bind the OpenGL texture and upload the frame data
+    GL.BindTexture(TextureTarget.Texture2D, videoTextureId);
+
+    // Ensure tight packing of pixel rows
+    GL.PixelStore(PixelStoreParameter.UnpackAlignment, 1);  // Changed from PixelStorei
+
+    GL.PixelStore(PixelStoreParameter.UnpackRowLength, width); // Set the unpack alignment based on linesize
+    GL.TexSubImage2D(TextureTarget.Texture2D, 0, 0, 0, width, height, PixelFormat.Rgba, PixelType.UnsignedByte, frameData);
+    GL.PixelStore(PixelStoreParameter.UnpackRowLength, 0);
+}
+
+    private int vao, vbo;
+
+private void InitializeQuad()
+{
+    float[] vertices = {
+        // positions    // texture coords
+        -1.0f, -1.0f,   0.0f, 1.0f, // bottom left
+         1.0f, -1.0f,   1.0f, 1.0f, // bottom right
+        -1.0f,  1.0f,   0.0f, 0.0f, // top left
+         1.0f,  1.0f,   1.0f, 0.0f  // top right
+    };
+
+    // Generate and bind a Vertex Array Object (VAO)
+    vao = GL.GenVertexArray();
+    GL.BindVertexArray(vao);
+
+    // Generate a Vertex Buffer Object (VBO)
+    vbo = GL.GenBuffer();
+    GL.BindBuffer(BufferTarget.ArrayBuffer, vbo);
+    GL.BufferData(BufferTarget.ArrayBuffer, vertices.Length * sizeof(float), vertices, BufferUsageHint.StaticDraw);
+
+    // Define the vertex attributes for position and texture coordinates
+    GL.VertexAttribPointer(0, 2, VertexAttribPointerType.Float, false, 4 * sizeof(float), 0);
+    GL.EnableVertexAttribArray(0);
+
+    GL.VertexAttribPointer(1, 2, VertexAttribPointerType.Float, false, 4 * sizeof(float), 2 * sizeof(float));
+    GL.EnableVertexAttribArray(1);
+
+    // Unbind the VBO and VAO
+    GL.BindBuffer(BufferTarget.ArrayBuffer, 0);
+    GL.BindVertexArray(0);
+}
+
+
+    private void RenderQuad()
+    {
+        // Bind the VAO and draw the quad
+        GL.BindVertexArray(vao);
+        GL.DrawArrays(PrimitiveType.TriangleStrip, 0, 4);
+        GL.BindVertexArray(0);
+    }
         public void Start()
         {
             Manager.Begin();
@@ -155,25 +515,23 @@ namespace SysDVR.Client.GUI
         // For imgui usage, this function draws the current frame
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public bool DrawAsync()
-        {
-            if (Video is null)
-                return false;
+{
+    if (Video == null)
+        return false;
 
-            if (Video.DecodeFrame())
-            {
-                fps.OnFrame();
-            }
+    if (Video.DecodeFrame())
+    {
+        fps.OnFrame();
+    }
 
-            // Bypass imgui for this
-            SDL_RenderCopy(Program.SdlCtx.RendererHandle, Video.TargetTexture, ref Video.TargetTextureSize, ref DisplayRect);
+    // Render the frame using OpenGL
+    RenderFrame();
 
-            // Signal we're presenting something to SDL to kick the decoding thread
-            // We don't care if we didn't actually decode anything we just do it here
-            // to do this on every vsync to avoid arbitrary sleeps on the other side
-            Video.Decoder.OnFrameEvent.Set();
+    // Signal we're presenting something to SDL to kick the decoding thread
+    Video.Decoder.OnFrameEvent.Set();
 
-            return true;
-        }
+    return true;
+}
 
         // For legacy player usage, this locks the thread until the next frame is ready
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -185,7 +543,7 @@ namespace SysDVR.Client.GUI
             if (!Video.DecodeFrame())
                 return false;
 
-			SDL_RenderCopy(Program.SdlCtx.RendererHandle, Video.TargetTexture, ref Video.TargetTextureSize, ref DisplayRect);
+			//SDL_RenderCopy(Program.SdlCtx.RendererHandle, Video.TargetTexture, ref Video.TargetTextureSize, ref DisplayRect);
 			Video.Decoder.OnFrameEvent.Set();
 
             return true;
@@ -279,6 +637,8 @@ namespace SysDVR.Client.GUI
 
         public PlayerView(PlayerManager manager)
         {
+
+            Console.WriteLine("Initializing PlayerView");
             // Adaptive rendering causes a lot of stuttering, for now avoid it in the video player
             RenderMode =
                 Program.Options.UncapStreaming ? FramerateCapOptions.Uncapped() :
@@ -339,7 +699,7 @@ namespace SysDVR.Client.GUI
             for (int i = 0; i < notifications.Count; i++)
             {
                 var notif = notifications[i];
-                ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(1, 0, 0, 1));
+                ImGui.PushStyleColor(ImGuiCol.Text, new System.Numerics.Vector4(1, 0, 0, 1));
                 ImGui.TextWrapped(notif.Text);
                 ImGui.PopStyleColor();
                 if (notif.ShouldRemove)
@@ -444,7 +804,7 @@ namespace SysDVR.Client.GUI
 
                 var btnwidth = width * 3 / 6;
                 var btnheight = (ImGui.GetWindowSize().Y - ImGui.GetCursorPosY()) / 8;
-                var btnsize = new Vector2(btnwidth, btnheight);
+                var btnsize = new System.Numerics.Vector2(btnwidth, btnheight);
 
                 var center = width / 2 - btnwidth / 2;
 

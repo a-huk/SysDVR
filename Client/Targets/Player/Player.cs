@@ -174,13 +174,114 @@ namespace SysDVR.Client.Targets.Player
         public object TextureLock;
         public IntPtr TargetTexture;
         public SDL_Rect TargetTextureSize;
-
+        public int FrameWidth => StreamInfo.VideoWidth;
+        public int FrameHeight => StreamInfo.VideoHeight;
         public VideoPlayer(string? preferredDecoderName, bool hwAccel)
         {
             InitVideoDecoder(preferredDecoderName, hwAccel);
             InitSDLRenderTexture();
         }
 
+        public unsafe byte[] GetDecodedFrame()
+{
+    // Ensure that a frame has been decoded
+    AVFrame* frame = Decoder.RenderFrame;
+
+    if (frame == null || frame->data[0] == null)
+    {
+        return null; // No frame available
+    }
+
+    // Lock the codec to ensure thread safety
+    lock (Decoder.CodecLock)
+    {
+        // Create a new frame for the RGBA data
+        AVFrame* rgbFrame = av_frame_alloc();
+        if (rgbFrame == null)
+        {
+            throw new Exception("Could not allocate RGB frame.");
+        }
+
+        try
+        {
+            // Set properties for the RGB frame
+            rgbFrame->format = (int)AVPixelFormat.AV_PIX_FMT_RGBA;
+            rgbFrame->width = frame->width;
+            rgbFrame->height = frame->height;
+
+            // Allocate buffer for the RGB frame with minimal alignment
+            int ret = av_frame_get_buffer(rgbFrame, 1); // Use alignment of 1
+            if (ret < 0)
+            {
+                throw new Exception("Could not allocate buffer for RGB frame.");
+            }
+
+            // Initialize the SwsContext for conversion
+            SwsContext* swsCtx = sws_getContext(
+                frame->width, frame->height, (AVPixelFormat)frame->format,
+                rgbFrame->width, rgbFrame->height, AVPixelFormat.AV_PIX_FMT_RGBA,
+                SWS_BILINEAR, null, null, null);
+
+            if (swsCtx == null)
+            {
+                throw new Exception("Could not initialize the conversion context.");
+            }
+
+            try
+            {
+                // Perform the conversion from the original format to RGBA
+                ret = sws_scale(
+                    swsCtx,
+                    frame->data,
+                    frame->linesize,
+                    0,
+                    frame->height,
+                    rgbFrame->data,
+                    rgbFrame->linesize);
+
+                if (ret <= 0)
+                {
+                    throw new Exception("sws_scale failed during conversion.");
+                }
+
+                // Calculate the size of one row without padding
+                int rowSize = rgbFrame->width * 4; // 4 bytes per pixel for RGBA
+
+                // Create a managed byte array to hold the RGBA data
+                byte[] buffer = new byte[rowSize * rgbFrame->height];
+
+                // Copy the data from the unmanaged RGB frame to the managed byte array, line by line
+                for (int y = 0; y < rgbFrame->height; y++)
+                {
+                    IntPtr srcPtr = (IntPtr)(rgbFrame->data[0] + y * rgbFrame->linesize[0]);
+                    int destOffset = y * rowSize;
+                    Marshal.Copy(srcPtr, buffer, destOffset, rowSize);
+                }
+
+                return buffer;
+            }
+            finally
+            {
+                // Free the SwsContext after conversion
+                sws_freeContext(swsCtx);
+            }
+        }
+        finally
+        {
+            // Free the allocated RGB frame
+            av_frame_free(&rgbFrame);
+        }
+    }
+}
+
+
+
+        public bool RenderFrame()
+        {
+            // Attempt to decode a frame and update the SDL texture.
+            // If DecodeFrame returns true, a new frame was rendered.
+            return DecodeFrame();
+        }
         void InitSDLRenderTexture()
         {
             Program.SdlCtx.BugCheckThreadId();
